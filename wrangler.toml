@@ -1,0 +1,12 @@
+name = "magic-cabin"
+main = "index.js"
+compatibility_date = "2026-02-25"
+
+# 这里的 binding 必须和代码里的 env.CHAT_KV 对应
+[[kv_namespaces]]
+binding = "CHAT_KV"
+id = "这里填入你创建的KV空间的ID"
+
+[vars]
+# 这里可以设置默认提醒，或者让用户在后台手动添加
+CHAT_PASSWORD = "这里填入你的通关暗号"
