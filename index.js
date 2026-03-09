@@ -12,66 +12,90 @@ export default {
 
     if (pathname === "/api/messages") {
       if (!isAuth(request)) return new Response("Unauthorized", { status: 401 });
-      const data = await env.CHAT_KV.get("msgs");
-      return new Response(data || "[]", {
-        headers: { "content-type": "application/json;charset=UTF-8" },
-      });
+
+      try {
+        const data = await env.CHAT_KV.get("msgs");
+        JSON.parse(data || "[]");
+        return new Response(data || "[]", {
+          headers: { "content-type": "application/json;charset=UTF-8" },
+        });
+      } catch (err) {
+        return json({ error: "Server Error" }, { status: 500 });
+      }
     }
 
     if (pathname === "/api/send" && request.method === "POST") {
       if (!isAuth(request)) return new Response("Unauthorized", { status: 401 });
 
-      const body = await request.json();
-      const raw = (await env.CHAT_KV.get("msgs")) || "[]";
-      const history = JSON.parse(raw);
+      try {
+        const body = await request.json();
+        const raw = (await env.CHAT_KV.get("msgs")) || "[]";
+        const history = JSON.parse(raw);
 
-      const now = Date.now();
-      const newMsg = {
-        id: "m-" + now + "-" + Math.random().toString(36).slice(2, 8),
-        nick: (body.nick || "小巫师").trim() || "小巫师",
-        text: String(body.text || ""),
-        tag: (body.tag || "").trim().slice(0, 20),
-        timestamp: now,
-      };
+        const now = Date.now();
+        const newMsg = {
+          id: "m-" + now + "-" + Math.random().toString(36).slice(2, 8),
+          nick: (body.nick || "小巫师").trim() || "小巫师",
+          text: String(body.text || ""),
+          tag: (body.tag || "").trim().slice(0, 20),
+          timestamp: now,
+        };
 
-      history.push(newMsg);
-      await env.CHAT_KV.put("msgs", JSON.stringify(history.slice(-100)));
+        history.push(newMsg);
+        await env.CHAT_KV.put("msgs", JSON.stringify(history.slice(-100)));
 
-      return json({ id: newMsg.id, timestamp: newMsg.timestamp });
+        return json({ id: newMsg.id, timestamp: newMsg.timestamp });
+      } catch (err) {
+        return json({ error: "Bad Request" }, { status: 400 });
+      }
     }
 
     if (pathname === "/api/update-tag" && request.method === "POST") {
       if (!isAuth(request)) return new Response("Unauthorized", { status: 401 });
 
-      const { id, tag } = await request.json();
-      const history = JSON.parse((await env.CHAT_KV.get("msgs")) || "[]");
-      const idx = history.findIndex((m) => m.id === id);
+      try {
+        const { id, tag } = await request.json();
+        const history = JSON.parse((await env.CHAT_KV.get("msgs")) || "[]");
+        const idx = history.findIndex((m) => m.id === id);
 
-      if (idx !== -1) {
-        history[idx].tag = (tag || "").trim();
-        await env.CHAT_KV.put("msgs", JSON.stringify(history));
+        if (idx !== -1) {
+          history[idx].tag = (tag || "").trim().slice(0, 20);
+          await env.CHAT_KV.put("msgs", JSON.stringify(history));
+        }
+
+        return new Response("ok");
+      } catch (err) {
+        return json({ error: "Bad Request" }, { status: 400 });
       }
-
-      return new Response("ok");
     }
 
     if (pathname === "/api/delete" && request.method === "POST") {
       if (!isAuth(request)) return new Response("Unauthorized", { status: 401 });
 
-      const { id } = await request.json();
-      const history = JSON.parse((await env.CHAT_KV.get("msgs")) || "[]");
-      await env.CHAT_KV.put(
-        "msgs",
-        JSON.stringify(history.filter((m) => m.id !== id))
-      );
+      try {
+        const { id } = await request.json();
+        const history = JSON.parse((await env.CHAT_KV.get("msgs")) || "[]");
 
-      return new Response("ok");
+        await env.CHAT_KV.put(
+          "msgs",
+          JSON.stringify(history.filter((m) => m.id !== id))
+        );
+
+        return new Response("ok");
+      } catch (err) {
+        return json({ error: "Bad Request" }, { status: 400 });
+      }
     }
 
     if (pathname === "/api/clear" && request.method === "POST") {
       if (!isAuth(request)) return new Response("Unauthorized", { status: 401 });
-      await env.CHAT_KV.put("msgs", "[]");
-      return new Response("ok");
+
+      try {
+        await env.CHAT_KV.put("msgs", "[]");
+        return new Response("ok");
+      } catch (err) {
+        return json({ error: "Server Error" }, { status: 500 });
+      }
     }
 
     return new Response(
@@ -446,6 +470,10 @@ export default {
     let pendingDeleteSnapshots = new Map();
 
     const AUTO_HIDE_MS = 5000;
+    const BASE_TITLE = 'MagicCabin 🪄';
+    let unreadCount = 0;
+    let titleFlashTimer = null;
+    let titleFlashIndex = 0;
 
     const chatList = document.getElementById('chat-list');
     const nickInput = document.getElementById('nick');
@@ -464,14 +492,17 @@ export default {
 
     const savedNick = localStorage.getItem('chat_nick');
     if (savedNick) nickInput.value = savedNick;
-    nickInput.addEventListener('change', (e) => {
+    nickInput.addEventListener('change', function (e) {
       localStorage.setItem('chat_nick', e.target.value);
     });
 
     const savedNotify = localStorage.getItem('notify_enabled');
     notifyToggle.checked = savedNotify === null ? true : savedNotify === 'true';
-    notifyToggle.onchange = () => {
+    notifyToggle.onchange = function () {
       localStorage.setItem('notify_enabled', String(notifyToggle.checked));
+      if (!notifyToggle.checked) {
+        stopTitleNotify();
+      }
     };
 
     const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2870/2870-preview.mp3');
@@ -501,10 +532,74 @@ export default {
 
     function playMagicSound() {
       audio.currentTime = 0;
-      audio.play().catch((e) => {
+      audio.play().catch(function (e) {
         console.log('notify sound failed:', e);
       });
     }
+
+    function applyDocumentTitle() {
+      if (unreadCount <= 0) {
+        document.title = BASE_TITLE;
+        return;
+      }
+
+      const titles = [
+        '(' + unreadCount + ') ' + BASE_TITLE,
+        '✨ 有新消息 · ' + BASE_TITLE
+      ];
+
+      document.title = titles[titleFlashIndex % titles.length];
+      titleFlashIndex++;
+    }
+
+    function startTitleNotify(count) {
+      const addCount = typeof count === 'number' ? count : 1;
+      unreadCount += addCount;
+
+      if (document.visibilityState === 'visible') {
+        document.title = BASE_TITLE;
+        return;
+      }
+
+      applyDocumentTitle();
+
+      if (titleFlashTimer) return;
+
+      titleFlashTimer = setInterval(function () {
+        if (document.visibilityState === 'visible') return;
+        applyDocumentTitle();
+      }, 1000);
+    }
+
+    function stopTitleNotify() {
+      unreadCount = 0;
+      titleFlashIndex = 0;
+
+      if (titleFlashTimer) {
+        clearInterval(titleFlashTimer);
+        titleFlashTimer = null;
+      }
+
+      document.title = BASE_TITLE;
+    }
+
+    function triggerNotify(newCount) {
+      const count = typeof newCount === 'number' ? newCount : 1;
+      if (!notifyToggle.checked || count <= 0) return;
+
+      if (document.visibilityState !== 'visible') {
+        startTitleNotify(count);
+        playMagicSound();
+      }
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') {
+        stopTitleNotify();
+      }
+    });
+
+    window.addEventListener('focus', stopTitleNotify);
 
     function escapeHtml(str) {
       return String(str || '')
@@ -518,7 +613,11 @@ export default {
     function formatDate(m) {
       if (!m.timestamp) return "";
       const d = new Date(m.timestamp);
-      return \`\${d.getFullYear()}-\${String(d.getMonth()+1).padStart(2,'0')}-\${String(d.getDate()).padStart(2,'0')} \${String(d.getHours()).padStart(2,'0')}:\${String(d.getMinutes()).padStart(2,'0')}\`;
+      return String(d.getFullYear()) + '-' +
+        String(d.getMonth() + 1).padStart(2, '0') + '-' +
+        String(d.getDate()).padStart(2, '0') + ' ' +
+        String(d.getHours()).padStart(2, '0') + ':' +
+        String(d.getMinutes()).padStart(2, '0');
     }
 
     function getTagStyle(str) {
@@ -557,6 +656,12 @@ export default {
       btn.style.borderColor = s.border;
     }
 
+    function applySendTag(tag) {
+      currentTag = String(tag || '').trim().replace(/^#/, '').slice(0, 20);
+      renderSendTagButton();
+      msgInput.focus();
+    }
+
     function editSendTag() {
       const t = prompt("输入发送标签（留空可清除）：", currentTag || "");
       if (t === null) return;
@@ -589,12 +694,13 @@ export default {
       return manualRevealedIds.has(id) || autoRevealedIds.has(id);
     }
 
-    function openConfirmModal({
-      title = '确认操作',
-      desc = '请确认是否继续。',
-      okText = '确定',
-      okClass = 'bg-red-500 hover:bg-red-600'
-    } = {}) {
+    function openConfirmModal(config) {
+      const options = config || {};
+      const title = options.title || '确认操作';
+      const desc = options.desc || '请确认是否继续。';
+      const okText = options.okText || '确定';
+      const okClass = options.okClass || 'bg-red-500 hover:bg-red-600';
+
       confirmTitle.textContent = title;
       confirmDesc.textContent = desc;
       confirmOkBtn.textContent = okText;
@@ -603,7 +709,7 @@ export default {
 
       confirmModal.classList.add('show');
 
-      return new Promise((resolve) => {
+      return new Promise(function (resolve) {
         confirmResolver = resolve;
       });
     }
@@ -616,16 +722,17 @@ export default {
       }
     }
 
-    confirmCancelBtn.addEventListener('click', () => closeConfirmModal(false));
-    confirmBackdrop.addEventListener('click', () => closeConfirmModal(false));
-    confirmOkBtn.addEventListener('click', () => closeConfirmModal(true));
-    document.addEventListener('keydown', (e) => {
+    confirmCancelBtn.addEventListener('click', function () { closeConfirmModal(false); });
+    confirmBackdrop.addEventListener('click', function () { closeConfirmModal(false); });
+    confirmOkBtn.addEventListener('click', function () { closeConfirmModal(true); });
+    document.addEventListener('keydown', function (e) {
       if (e.key === 'Escape' && confirmModal.classList.contains('show')) {
         closeConfirmModal(false);
       }
     });
 
-    function autoRevealMessage(id, ms = AUTO_HIDE_MS) {
+    function autoRevealMessage(id, ms) {
+      const duration = typeof ms === 'number' ? ms : AUTO_HIDE_MS;
       if (manualRevealedIds.has(id)) return;
 
       autoRevealedIds.add(id);
@@ -635,11 +742,11 @@ export default {
         clearTimeout(autoHideTimers.get(id));
       }
 
-      const timer = setTimeout(() => {
+      const timer = setTimeout(function () {
         autoRevealedIds.delete(id);
         autoHideTimers.delete(id);
         updateMessageRevealState(id);
-      }, ms);
+      }, duration);
 
       autoHideTimers.set(id, timer);
     }
@@ -653,14 +760,15 @@ export default {
       updateMessageRevealState(id);
     }
 
-    async function api(url, options = {}) {
-      options.headers = {
-        ...options.headers,
+    async function api(url, options) {
+      const finalOptions = options || {};
+      finalOptions.headers = {
+        ...finalOptions.headers,
         'Authorization': password,
         'Content-Type': 'application/json'
       };
 
-      const res = await fetch(url, options);
+      const res = await fetch(url, finalOptions);
 
       if (res.status === 401) {
         const input = prompt("🔐 暗号：");
@@ -676,42 +784,43 @@ export default {
 
     function getFilteredData() {
       const list = currentFilter
-        ? rawData.filter(m => m.tag === currentFilter)
+        ? rawData.filter(function (m) { return m.tag === currentFilter; })
         : rawData.slice();
 
-      return list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      return list.sort(function (a, b) {
+        return (b.timestamp || 0) - (a.timestamp || 0);
+      });
     }
 
     function renderTags() {
       const bar = document.getElementById('tag-filter-bar');
-      const tags = [...new Set(rawData.map(m => m.tag).filter(Boolean))];
+      const tags = [...new Set(rawData.map(function (m) { return m.tag; }).filter(Boolean))];
 
-      let html = \`
-        <span onclick="setFilter(null)" class="magic-tag shrink-0 cursor-pointer \${!currentFilter ? 'bg-slate-800 text-white' : 'bg-slate-100 text-slate-500'}">全部</span>
-      \`;
+      let html = 
+        '<span onclick="setFilter(null)" class="magic-tag shrink-0 cursor-pointer ' +
+        (!currentFilter ? 'bg-slate-800 text-white' : 'bg-slate-100 text-slate-500') +
+        '">全部</span>';
 
-      tags.forEach(t => {
+      tags.forEach(function (t) {
         const s = getTagStyle(t);
         const active = currentFilter === t;
-        html += \`
-          <span
-            onclick="setFilter(\${JSON.stringify(t)})"
-            class="magic-tag shrink-0 cursor-pointer \${active ? 'ring-1 ring-slate-300 shadow-sm' : ''}"
-            style="background:\${s.bg}; color:\${s.text}; border-color:\${s.border}"
-          >#\${escapeHtml(t)}</span>
-        \`;
+        html +=
+          '<span ' +
+            'onclick="setFilter(' + JSON.stringify(t).replaceAll('"', '&quot;') + ')" ' +
+            'class="magic-tag shrink-0 cursor-pointer ' + (active ? 'ring-1 ring-slate-300 shadow-sm' : '') + '" ' +
+            'style="background:' + s.bg + '; color:' + s.text + '; border-color:' + s.border + '"' +
+          '>#' + escapeHtml(t) + '</span>';
       });
 
       bar.innerHTML = html;
     }
 
     function renderEmptyState() {
-      chatList.innerHTML = \`
-        <div id="empty-state" class="text-center text-slate-400 text-sm py-12">
-          <div class="text-2xl mb-2">✨</div>
-          <div>\${currentFilter ? '这个标签下还没有咒语' : '这里还没有咒语'}</div>
-        </div>
-      \`;
+      chatList.innerHTML =
+        '<div id="empty-state" class="text-center text-slate-400 text-sm py-12">' +
+          '<div class="text-2xl mb-2">✨</div>' +
+          '<div>' + (currentFilter ? '这个标签下还没有咒语' : '这里还没有咒语') + '</div>' +
+        '</div>';
     }
 
     function removeEmptyState() {
@@ -724,47 +833,66 @@ export default {
       const revealed = isRevealed(m.id);
       const timeText = formatDate(m);
 
-      return \`
-        <div class="flex justify-between items-start mb-4 gap-3">
-          <div class="flex items-center gap-3 min-w-0">
-            <div class="magic-avatar">\${escapeHtml((m.nick || '咒').slice(0, 1))}</div>
-            <div class="min-w-0">
-              <div class="flex items-center gap-2 min-w-0 flex-wrap">
-                <div class="text-[13px] font-bold text-slate-800 truncate" data-role="nick">\${escapeHtml(m.nick || '匿名')}</div>
-                <div class="text-[11px] text-slate-400" data-role="time">\${escapeHtml(timeText)}</div>
-              </div>
-            </div>
-          </div>
+      let tagHtml = '';
+      if (m.tag) {
+        const tagJson = JSON.stringify(m.tag).replaceAll('"', '&quot;');
+        tagHtml =
+          '<span onclick="applySendTag(' + tagJson + ')" class="magic-tag cursor-pointer" ' +
+          'style="background:' + s.bg + '; color:' + s.text + '; border-color:' + s.border + '" ' +
+          'title="点击设为发送标签">#' + escapeHtml(m.tag) + '</span>';
+      }
 
-          <div class="flex gap-2 shrink-0">
-            <button onclick="toggleEye('\${m.id}')" class="toolbar-btn toolbar-btn-primary \${revealed ? 'is-active' : ''}" data-role="eye-btn" title="\${revealed ? '隐藏' : '查看'}">
-              <i class="fa-solid \${revealed ? 'fa-eye' : 'fa-eye-slash'} text-[13px]" data-role="eye-icon"></i>
-            </button>
+      const editTagJson = JSON.stringify(m.tag || '').replaceAll('"', '&quot;');
 
-            <button onclick="deleteMsg('\${m.id}', event)" class="toolbar-btn toolbar-btn-danger" title="删除">
-              <i class="fa-solid fa-trash-can text-[13px]"></i>
-            </button>
-          </div>
-        </div>
+      let sealedHtml = '';
+      if (!revealed) {
+        sealedHtml =
+          '<div class="sealed-overlay" data-role="sealed">' +
+            '<span style="display:flex;align-items:center;gap:6px;">' +
+              '<i class="fa-solid fa-lock" style="font-size:11px;"></i>' +
+              '<span>咒语已被封印，点击眼睛解封</span>' +
+            '</span>' +
+          '</div>';
+      }
 
-        <div class="flex items-center gap-2 mb-2 min-h-[20px]">
-          <div data-role="tag-box">
-            \${m.tag ? \`<span class="magic-tag" style="background:\${s.bg}; color:\${s.text}; border-color:\${s.border}">#\${escapeHtml(m.tag)}</span>\` : ''}
-          </div>
+      return '' +
+        '<div class="flex justify-between items-start mb-4 gap-3">' +
+          '<div class="flex items-center gap-3 min-w-0">' +
+            '<div class="magic-avatar">' + escapeHtml((m.nick || '咒').slice(0, 1)) + '</div>' +
+            '<div class="min-w-0">' +
+              '<div class="flex items-center gap-2 min-w-0 flex-wrap">' +
+                '<div class="text-[13px] font-bold text-slate-800 truncate" data-role="nick">' + escapeHtml(m.nick || '匿名') + '</div>' +
+                '<div class="text-[11px] text-slate-400" data-role="time">' + escapeHtml(timeText) + '</div>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
 
-          <button onclick="updateTag('\${m.id}', \${JSON.stringify(m.tag || '')})" class="toolbar-btn toolbar-btn-soft !w-6 !h-6" title="编辑标签">
-            <i class="fa-solid fa-pen text-[10px]"></i>
-          </button>
-        </div>
+          '<div class="flex gap-2 shrink-0">' +
+            '<button onclick="toggleEye(\\'' + m.id + '\\')" class="toolbar-btn toolbar-btn-primary ' + (revealed ? 'is-active' : '') + '" data-role="eye-btn" title="' + (revealed ? '隐藏' : '查看') + '">' +
+              '<i class="fa-solid ' + (revealed ? 'fa-eye' : 'fa-eye-slash') + ' text-[13px]" data-role="eye-icon"></i>' +
+            '</button>' +
 
-        <div class="relative min-h-[54px] bg-slate-50 rounded-xl p-3" data-role="body-wrap">
-          \${!revealed ? \`<div class="sealed-overlay" data-role="sealed"><span style="display:flex;align-items:center;gap:6px;"><i class="fa-solid fa-lock" style="font-size:11px;"></i><span>咒语已被封印，点击眼睛解封</span></span></div>\` : ''}
-          <div class="message-body text-sm text-slate-700 leading-6 \${!revealed ? 'opacity-0' : 'opacity-100'}" data-role="message-body">\${escapeHtml(m.text || '')}</div>
-        </div>
-      \`;
+            '<button onclick="deleteMsg(\\'' + m.id + '\\', event)" class="toolbar-btn toolbar-btn-danger" title="删除">' +
+              '<i class="fa-solid fa-trash-can text-[13px]"></i>' +
+            '</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="flex items-center gap-2 mb-2 min-h-[20px]">' +
+          '<div data-role="tag-box">' + tagHtml + '</div>' +
+
+          '<button onclick="updateTag(\\'' + m.id + '\\', ' + editTagJson + ')" class="toolbar-btn toolbar-btn-soft !w-6 !h-6" title="编辑标签">' +
+            '<i class="fa-solid fa-pen text-[10px]"></i>' +
+          '</button>' +
+        '</div>' +
+
+        '<div class="relative min-h-[54px] bg-slate-50 rounded-xl p-3" data-role="body-wrap">' +
+          sealedHtml +
+          '<div class="message-body text-sm text-slate-700 leading-6 ' + (!revealed ? 'opacity-0' : 'opacity-100') + '" data-role="message-body">' + escapeHtml(m.text || '') + '</div>' +
+        '</div>';
     }
 
-    function createMessageCard(m, animate = false) {
+    function createMessageCard(m, animate) {
       const div = document.createElement('div');
       div.className = 'spell-card p-5' + (animate ? ' fade-enter' : '');
       div.dataset.id = m.id;
@@ -772,7 +900,8 @@ export default {
       return div;
     }
 
-    function rebuildVisibleList(animateNewIds = new Set()) {
+    function rebuildVisibleList(animateNewIds) {
+      const animateIds = animateNewIds || new Set();
       const filtered = getFilteredData();
 
       messageDomMap.clear();
@@ -783,8 +912,8 @@ export default {
         return;
       }
 
-      filtered.forEach((m) => {
-        const el = createMessageCard(m, animateNewIds.has(m.id));
+      filtered.forEach(function (m) {
+        const el = createMessageCard(m, animateIds.has(m.id));
         chatList.appendChild(el);
         messageDomMap.set(m.id, el);
       });
@@ -843,18 +972,25 @@ export default {
       if (body) body.textContent = message.text || '';
 
       if (tagBox) {
-        tagBox.innerHTML = message.tag
-          ? \`<span class="magic-tag" style="background:\${s.bg}; color:\${s.text}; border-color:\${s.border}">#\${escapeHtml(message.tag)}</span>\`
-          : '';
+        if (message.tag) {
+          const tagJson = JSON.stringify(message.tag).replaceAll('"', '&quot;');
+          tagBox.innerHTML =
+            '<span onclick="applySendTag(' + tagJson + ')" class="magic-tag cursor-pointer" ' +
+            'style="background:' + s.bg + '; color:' + s.text + '; border-color:' + s.border + '" ' +
+            'title="点击设为发送标签">#' + escapeHtml(message.tag) + '</span>';
+        } else {
+          tagBox.innerHTML = '';
+        }
       }
 
       updateMessageRevealState(id);
     }
 
-    function insertMessageCard(message, animate = true) {
+    function insertMessageCard(message, animate) {
+      const shouldAnimate = animate !== false;
       removeEmptyState();
 
-      const el = createMessageCard(message, animate);
+      const el = createMessageCard(message, shouldAnimate);
       const currentEls = [...chatList.querySelectorAll('.spell-card')];
 
       if (!currentEls.length) {
@@ -866,8 +1002,8 @@ export default {
       let inserted = false;
       for (const existingEl of currentEls) {
         const existingId = existingEl.dataset.id;
-        const existingMsg = rawData.find(m => m.id === existingId);
-        const existingTs = existingMsg?.timestamp || 0;
+        const existingMsg = rawData.find(function (m) { return m.id === existingId; });
+        const existingTs = existingMsg && existingMsg.timestamp ? existingMsg.timestamp : 0;
         const newTs = message.timestamp || 0;
 
         if (newTs >= existingTs) {
@@ -892,11 +1028,11 @@ export default {
     }
 
     function getMessageById(id) {
-      return rawData.find(m => m.id === id) || null;
+      return rawData.find(function (m) { return m.id === id; }) || null;
     }
 
     function removeMessageFromLocalState(id) {
-      rawData = rawData.filter(m => m.id !== id);
+      rawData = rawData.filter(function (m) { return m.id !== id; });
       manualRevealedIds.delete(id);
       clearAutoReveal(id);
       mySentIds.delete(id);
@@ -905,7 +1041,7 @@ export default {
 
     function insertMessageToLocalState(message) {
       if (!message) return;
-      if (!rawData.some(m => m.id === message.id)) {
+      if (!rawData.some(function (m) { return m.id === message.id; })) {
         rawData.push(message);
       }
     }
@@ -925,11 +1061,11 @@ export default {
         if (!res.ok) return;
 
         const newData = await res.json();
-        const incomingIds = new Set(newData.map(m => m.id));
-        const oldMap = new Map(rawData.map(m => [m.id, m]));
-        const newMap = new Map(newData.map(m => [m.id, m]));
+        const incomingIds = new Set(newData.map(function (m) { return m.id; }));
+        const oldMap = new Map(rawData.map(function (m) { return [m.id, m]; }));
+        const newMap = new Map(newData.map(function (m) { return [m.id, m]; }));
 
-        let shouldPlay = false;
+        let newIncomingCount = 0;
         let tagsMayChanged = false;
         let needRebuildForFilter = false;
 
@@ -966,7 +1102,7 @@ export default {
             autoRevealMessage(m.id);
 
             if (!isMine) {
-              shouldPlay = true;
+              newIncomingCount++;
             }
 
             const shouldShowInCurrentView = !currentFilter || m.tag === currentFilter;
@@ -1027,8 +1163,8 @@ export default {
           }
         }
 
-        if (shouldPlay && notifyToggle.checked) {
-          playMagicSound();
+        if (newIncomingCount > 0) {
+          triggerNotify(newIncomingCount);
         }
       } catch (e) {
         console.error('load failed:', e);
@@ -1065,7 +1201,9 @@ export default {
         ev.stopPropagation();
         if (ev.currentTarget) {
           ev.currentTarget.blur();
-          setTimeout(() => ev.currentTarget && ev.currentTarget.blur(), 0);
+          setTimeout(function () {
+            if (ev.currentTarget) ev.currentTarget.blur();
+          }, 0);
         }
       }
 
@@ -1094,7 +1232,7 @@ export default {
       try {
         const res = await api('/api/delete', {
           method: 'POST',
-          body: JSON.stringify({ id })
+          body: JSON.stringify({ id: id })
         });
 
         if (!res.ok) throw new Error('delete failed');
@@ -1120,9 +1258,11 @@ export default {
     }
 
     async function clearAllMessages(ev) {
-      if (ev?.currentTarget) {
+      if (ev && ev.currentTarget) {
         ev.currentTarget.blur();
-        setTimeout(() => ev.currentTarget && ev.currentTarget.blur(), 0);
+        setTimeout(function () {
+          if (ev.currentTarget) ev.currentTarget.blur();
+        }, 0);
       }
 
       const confirmed = await openConfirmModal({
@@ -1156,6 +1296,7 @@ export default {
         pendingDeleteSnapshots.clear();
         chatList.innerHTML = '';
 
+        stopTitleNotify();
         renderTags();
         rebuildVisibleList();
       } catch (e) {
@@ -1205,7 +1346,7 @@ export default {
         renderSendTagButton();
 
         const result = await res.json();
-        if (result?.id) {
+        if (result && result.id) {
           mySentIds.add(result.id);
           autoRevealMessage(result.id);
         }
@@ -1229,7 +1370,7 @@ export default {
 
     msgInput.addEventListener('input', autoResizeTextarea);
     msgInput.addEventListener('focus', unlockAudio);
-    msgInput.onkeydown = (e) => {
+    msgInput.onkeydown = function (e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         send();
